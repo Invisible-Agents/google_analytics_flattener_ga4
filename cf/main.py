@@ -1,5 +1,6 @@
 import base64
 import json
+from google.api_core.exceptions import NotFound
 from google.cloud import bigquery
 from google.cloud import storage
 import re
@@ -56,6 +57,10 @@ class InputValidator(object):
 
 
 class GaExportedNestedDataStorage(object):
+
+    # prefix used to denote field names in flat_events which were created from event parameter keys
+    EP_PREFIX = 'ep_'
+
     def __init__(self, gcp_project, dataset, table_name, date_shard, type='DAILY'):#TODO: set this to INTRADAY for intraday flattening
 
         # main configurations
@@ -67,6 +72,9 @@ class GaExportedNestedDataStorage(object):
         self.type = type
 
         # The next several properties will correspond to GA4 fields
+
+        # event parameters to be pivoted into columns in flat_events
+        self.event_params_flat_fields = {}
 
         # These fields will be used to build a compound id of a unique event
         # stream_id is added to make sure that there is definitely no id collisions, if you have multiple data streams
@@ -324,6 +332,25 @@ class GaExportedNestedDataStorage(object):
                                                                       unique_event_id_fields[2],
                                                                       unique_event_id_fields[3])
 
+    def get_event_params_keys_and_types_query(self):
+        # get distinct set of event parameter keys from shard event table to dynamically extend flat_events schema
+        qry = """
+                WITH T as (
+                  SELECT event_params.key as event_params_key, 
+                  CONCAT(IF(event_params.value.string_value IS NULL, '','STRING'),
+                         IF(event_params.value.int_value IS NULL, '', 'INTEGER'), 
+                         IF(event_params.value.double_value IS NULL, '', 'DOUBLE'), 
+                         IF(event_params.value.float_value IS NULL, '', 'FLOAT')
+                        )  AS event_params_type
+                """
+
+        qry += " FROM `{p}.{ds}.{t}_{d}`".format(p=self.gcp_project, ds=self.dataset, t=self.table_name,
+                                                 d=self.date_shard)
+
+        qry += ", UNNEST (event_params) AS event_params) SELECT DISTINCT(event_params_key), event_params_type FROM T"
+
+        return qry
+
     def get_event_params_query(self):
         qry = "SELECT "
 
@@ -389,8 +416,15 @@ class GaExportedNestedDataStorage(object):
         for f in self.events_fields:
             qry += ",%s as %s" % (f, f.replace(".", "_"))
 
-        qry += " FROM `{p}.{ds}.{t}_{d}`".format(p=self.gcp_project, ds=self.dataset, t=self.table_name,
-                                                 d=self.date_shard)
+        # using list of flat event params field from set_dynamic_flat_events_schema()
+        for key, f_type in self.event_params_flat_fields.items():
+            if f_type == 'INTEGER':
+                f_type = 'int'
+            qry += ",(SELECT value.%s_value FROM UNNEST(events.event_params) WHERE key = '%s') AS %s%s" % (
+                f_type.lower(), key, self.EP_PREFIX, key)
+
+        qry += " FROM `{p}.{ds}.{t}_{d}` as events".format(p=self.gcp_project, ds=self.dataset, t=self.table_name,
+                                                           d=self.date_shard)
         return qry
 
     def _create_valid_bigquery_field_name(self, p_field):
@@ -565,6 +599,46 @@ class GaExportedNestedDataStorage(object):
                 dataframe=dataframe, destination=table_id_partitioned, job_config=load_job_config_partitioned
             )  # Make an API request.
             load_job_partition.result()  # Wait for the job to complete.
+
+    def set_dynamic_flat_events_schema(self):
+
+        # Get all event_params_keys and data types from original GA4 sharded table
+        query = self.get_event_params_keys_and_types_query()
+
+        client = bigquery.Client()
+        query_job_config = bigquery.QueryJobConfig(
+            dry_run=False)
+        query_job_schema = client.query(query, job_config=query_job_config)
+        event_params_rows = query_job_schema.result()
+
+        # get existing flat_events table schema
+        flat_events_table = "{p}.{ds}.flat_events".format(p=self.gcp_project, ds=self.dataset)
+        try:
+            table = client.get_table(flat_events_table)
+            original_schema = table.schema
+        except NotFound:
+            original_schema = self.partitioned_table_schemas['flat_events']
+            logging.info('flat_events table not found, using hardcoded schema')
+
+        # check all existing flat_events schema fields and add any event_params to list used in flat_events query
+        for schema_field in original_schema:
+            if schema_field.name.startswith(self.EP_PREFIX):
+                # add the raw field name and type for use in get_events_query() without prefix (to get raw params)
+                original_field_name = schema_field.name[len(self.EP_PREFIX):]  # remove prefix
+                self.event_params_flat_fields[original_field_name] = schema_field.field_type
+
+        # add any new event_params_keys from raw data to list used in flat_events query
+        for row in event_params_rows:
+            if row.event_params_key not in self.event_params_flat_fields:
+                self.event_params_flat_fields[row.event_params_key] = row.event_params_type
+
+        new_schema = original_schema[:]
+        # append new event_params fields to original schema with new prefix to avoid collisions
+        for ep_key, ep_type in self.event_params_flat_fields.items():
+            field_name = '{pre}{epk}'.format(pre=self.EP_PREFIX, epk=ep_key)
+            new_schema.append(bigquery.SchemaField(field_name, ep_type))
+
+        self.partitioned_table_schemas['flat_events'] = new_schema
 
 
 def flatten_ga_data(event, context):
