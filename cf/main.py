@@ -660,6 +660,9 @@ def flatten_ga_data(event, context):
                                                 table_name=input_event.table_name,
                                                 date_shard=input_event.table_date_shard)
 
+        # set dynamic flat events schema
+        ga_source.set_dynamic_flat_events_schema()
+
         # EVENT_PARAMS
         if input_event.flatten_nested_table(nested_table=os.environ["EVENT_PARAMS"]):
             ga_source.run_query_job(query=ga_source.get_event_params_query(), table_type="flat_event_params",
