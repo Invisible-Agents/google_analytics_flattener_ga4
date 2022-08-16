@@ -58,8 +58,8 @@ class InputValidator(object):
 
 class GaExportedNestedDataStorage(object):
 
-    # prefix used to denote field names in flat_events which were created from event parameter keys
-    EP_PREFIX = 'ep_'
+    # suffix used to denote field names in flat_events which were created from event parameter keys
+    EP_SUFFIX = '_ep'
 
     def __init__(self, gcp_project, dataset, table_name, date_shard, type='DAILY'):#TODO: set this to INTRADAY for intraday flattening
 
@@ -421,7 +421,7 @@ class GaExportedNestedDataStorage(object):
             if f_type == 'INTEGER':
                 f_type = 'int'
             qry += ",(SELECT value.%s_value FROM UNNEST(events.event_params) WHERE key = '%s') AS %s%s" % (
-                f_type.lower(), key, self.EP_PREFIX, key)
+                f_type.lower(), key, key, self.EP_SUFFIX)
 
         qry += " FROM `{p}.{ds}.{t}_{d}` as events".format(p=self.gcp_project, ds=self.dataset, t=self.table_name,
                                                            d=self.date_shard)
@@ -622,9 +622,9 @@ class GaExportedNestedDataStorage(object):
 
         # check all existing flat_events schema fields and add any event_params to list used in flat_events query
         for schema_field in original_schema:
-            if schema_field.name.startswith(self.EP_PREFIX):
-                # add the raw field name and type for use in get_events_query() without prefix (to get raw params)
-                original_field_name = schema_field.name[len(self.EP_PREFIX):]  # remove prefix
+            if schema_field.name.endswith(self.EP_SUFFIX):
+                # add the raw field name and type for use in get_events_query() without suffic (to get raw params)
+                original_field_name = schema_field.name[:len(schema_field.name) - len(self.EP_SUFFIX)]  # remove suffix
                 self.event_params_flat_fields[original_field_name] = schema_field.field_type
 
         # add any new event_params_keys from raw data to list used in flat_events query
@@ -633,9 +633,9 @@ class GaExportedNestedDataStorage(object):
                 self.event_params_flat_fields[row.event_params_key] = row.event_params_type
 
         new_schema = original_schema[:]
-        # append new event_params fields to original schema with new prefix to avoid collisions
+        # append new event_params fields to original schema with new suffix to avoid collisions
         for ep_key, ep_type in self.event_params_flat_fields.items():
-            field_name = '{pre}{epk}'.format(pre=self.EP_PREFIX, epk=ep_key)
+            field_name = '{epk}{suf}'.format(epk=ep_key, suf=self.EP_SUFFIX)
             new_schema.append(bigquery.SchemaField(field_name, ep_type))
 
         self.partitioned_table_schemas['flat_events'] = new_schema
