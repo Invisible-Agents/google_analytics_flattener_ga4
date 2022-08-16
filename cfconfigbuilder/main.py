@@ -160,8 +160,8 @@ FROM (
                 }}})
         return json_config_updated
 
-    def add_output_params_into_config(self, json_config, output_sharded=True,
-                                      output_partitioned=False):
+    def add_output_params_into_config(self, json_config, output_sharded=False,
+                                      output_partitioned=True):
         """
         Adds cfintraday config params to config file.
 
